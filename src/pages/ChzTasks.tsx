@@ -45,13 +45,21 @@ export default function ChzTasks() {
     setLoading(false);
   };
 
+  const [cooldown, setCooldown] = useState(0);
+
+  // Timer for cooldown
+  useEffect(() => {
+    if (cooldown > 0) {
+      const timer = setTimeout(() => setCooldown(cooldown - 1), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [cooldown]);
+
   const handleSyncWB = async () => {
-    if (syncing) return;
+    if (syncing || cooldown > 0) return;
     setSyncing(true);
     
     try {
-      // 1. Get WB Token (In a real app, this should be stored securely, e.g., in a Supabase table or env var)
-      // For this demo, we'll prompt the user or use a placeholder if not set in env.
       const wbToken = import.meta.env.VITE_WB_API_TOKEN;
       
       if (!wbToken) {
@@ -60,23 +68,46 @@ export default function ChzTasks() {
         return;
       }
 
-      // 2. Get last sync date from Supabase
+      // 1. Check DB first to prevent spamming WB API if another user just synced
       const { data: syncState, error: syncError } = await supabase
         .from('sync_state')
-        .select('last_change_date')
+        .select('last_change_date, updated_at')
         .eq('id', 'wb_sales_sync')
         .single();
 
       if (syncError) throw new Error('Не удалось получить дату последней синхронизации');
+
+      // Check if less than 60 seconds passed since last successful sync
+      const lastSyncTime = new Date(syncState.updated_at).getTime();
+      const now = new Date().getTime();
+      const secondsSinceLastSync = Math.floor((now - lastSyncTime) / 1000);
+
+      if (secondsSinceLastSync < 60) {
+        const waitTime = 60 - secondsSinceLastSync;
+        setCooldown(waitTime);
+        alert(`Данные недавно обновлялись. Следующий запрос к WB возможен через ${waitTime} сек.`);
+        setSyncing(false);
+        return;
+      }
       
       const dateFrom = new Date(syncState.last_change_date).toISOString().split('T')[0];
 
-      // 3. Fetch data from WB API
+      // 2. Fetch data from WB API
       const response = await fetch(`https://statistics-api.wildberries.ru/api/v1/supplier/sales?dateFrom=${dateFrom}&flag=0`, {
         headers: {
           'Authorization': wbToken
         }
       });
+
+      // 3. Smart Error Handling for 429 Too Many Requests
+      if (response.status === 429) {
+        // WB API usually doesn't send Retry-After in standard format, but we check just in case
+        const retryAfter = response.headers.get('Retry-After');
+        const waitSeconds = retryAfter ? parseInt(retryAfter, 10) : 60; // Default to 60s if header is missing
+        
+        setCooldown(waitSeconds);
+        throw new Error(`Слишком много запросов к WB (Лимит 1 запрос в минуту). Попробуйте через ${waitSeconds} сек.`);
+      }
 
       if (!response.ok) {
         throw new Error(`Ошибка API WB: ${response.status} ${response.statusText}`);
@@ -85,7 +116,14 @@ export default function ChzTasks() {
       const sales = await response.json();
 
       if (!sales || sales.length === 0) {
+        // Update the updated_at timestamp so the 60s cooldown applies even if no new data
+        await supabase
+          .from('sync_state')
+          .update({ updated_at: new Date().toISOString() })
+          .eq('id', 'wb_sales_sync');
+          
         alert('Нет новых данных о продажах или возвратах от WB.');
+        setCooldown(60); // Start cooldown
         setSyncing(false);
         return;
       }
@@ -122,22 +160,23 @@ export default function ChzTasks() {
         }
       }
 
-      // 5. Update last sync date
-      if (latestChangeDate !== syncState.last_change_date) {
-        await supabase
-          .from('sync_state')
-          .update({ last_change_date: latestChangeDate, updated_at: new Date().toISOString() })
-          .eq('id', 'wb_sales_sync');
-      }
+      // 5. Update last sync date AND updated_at timestamp
+      await supabase
+        .from('sync_state')
+        .update({ 
+          last_change_date: latestChangeDate, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('id', 'wb_sales_sync');
 
       alert(`Синхронизация завершена! Обновлено заказов: ${updatedCount}. Задачи ЧЗ созданы автоматически.`);
       
-      // Refresh the tasks list
+      setCooldown(60); // Start 60s cooldown after successful sync
       fetchTasks();
 
     } catch (error: any) {
       console.error('Sync error:', error);
-      alert(`Ошибка синхронизации: ${error.message}`);
+      alert(error.message);
     } finally {
       setSyncing(false);
     }
@@ -231,11 +270,11 @@ export default function ChzTasks() {
         <div className="flex items-center gap-3">
           <button
             onClick={handleSyncWB}
-            disabled={syncing}
+            disabled={syncing || cooldown > 0}
             className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-lg text-sm font-medium hover:bg-indigo-100 disabled:opacity-50 transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
-            {syncing ? 'Синхронизация...' : 'Обновить из WB'}
+            {syncing ? 'Синхронизация...' : cooldown > 0 ? `Доступно через ${cooldown} сек` : 'Обновить из WB'}
           </button>
           <div className="w-px h-6 bg-zinc-300 mx-1"></div>
           <button
