@@ -21,63 +21,7 @@ serve(async (req) => {
       throw new Error('WB_API_TOKEN is not set in Supabase Secrets')
     }
 
-    let enrichedCount = 0
-
-    // ====================================================================
-    // ШАГ 1: ОБОГАЩЕНИЕ ДАННЫХ (Получение SRID/RID из FBS API)
-    // ====================================================================
-    // Проверяем, есть ли в базе заказы, у которых еще нет srid
-    const { data: missingOrders, error: missingError } = await supabase
-      .from('orders')
-      .select('id')
-      .is('srid', null)
-
-    if (!missingError && missingOrders && missingOrders.length > 0) {
-      const missingIds = new Set(missingOrders.map(o => o.id))
-      
-      // Берем заказы за последние 5 дней (с запасом, в Unix timestamp)
-      const dateFromUnix = Math.floor(Date.now() / 1000) - (5 * 24 * 60 * 60)
-      let next = 0
-      let fetchCount = 0
-      const MAX_REQUESTS = 10 // Защита от бесконечного цикла
-      
-      let allFbsOrders: any[] = []
-
-      do {
-        const fbsResponse = await fetch(`https://marketplace-api.wildberries.ru/api/v3/orders?limit=1000&next=${next}&dateFrom=${dateFromUnix}`, {
-          headers: { 'Authorization': wbToken }
-        })
-
-        if (!fbsResponse.ok) {
-          console.warn(`FBS API Error: ${fbsResponse.status} ${fbsResponse.statusText}`)
-          break // Прерываем обогащение, но продолжаем работу функции (переходим к Шагу 2)
-        }
-
-        const fbsData = await fbsResponse.json()
-        if (fbsData.orders) {
-            allFbsOrders.push(...fbsData.orders)
-        }
-        next = fbsData.next
-        fetchCount++
-      } while (next && next !== 0 && fetchCount < MAX_REQUESTS)
-
-      // Обновляем базу найденными rid
-      for (const wbOrder of allFbsOrders) {
-        if (missingIds.has(wbOrder.id) && wbOrder.rid) {
-          const { error: updateErr } = await supabase
-            .from('orders')
-            .update({ srid: wbOrder.rid })
-            .eq('id', wbOrder.id)
-          
-          if (!updateErr) enrichedCount++
-        }
-      }
-      console.log(`Обогащено заказов (добавлен srid): ${enrichedCount}`)
-    }
-
-    // ====================================================================
-    // ШАГ 2: ОБРАБОТКА ПРОДАЖ (API Статистики)
-    // ====================================================================
+    // 1. Получаем дату последней синхронизации
     const { data: syncState, error: syncError } = await supabase
       .from('sync_state')
       .select('last_change_date')
@@ -88,6 +32,7 @@ serve(async (req) => {
     
     const dateFrom = syncState.last_change_date
 
+    // 2. Качаем продажи из WB API Статистики
     const response = await fetch(`https://statistics-api.wildberries.ru/api/v1/supplier/sales?dateFrom=${encodeURIComponent(dateFrom)}&flag=0`, {
       headers: { 'Authorization': wbToken }
     })
@@ -95,41 +40,42 @@ serve(async (req) => {
     if (response.status === 429) {
       const retryAfter = response.headers.get('X-Ratelimit-Retry')
       const waitSeconds = retryAfter ? parseInt(retryAfter, 10) : 60
-      
       return new Response(
-        JSON.stringify({ 
-          error: 'Rate limit exceeded', 
-          message: `Слишком много запросов к WB. Попробуйте через ${waitSeconds} сек.`,
-          retryAfter: waitSeconds
-        }),
+        JSON.stringify({ error: 'Rate limit exceeded', message: `Слишком много запросов к WB. Попробуйте через ${waitSeconds} сек.`, retryAfter: waitSeconds }),
         { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
-    if (!response.ok) {
-      throw new Error(`WB API Error: ${response.status} ${response.statusText}`)
-    }
+    if (!response.ok) throw new Error(`WB API Error: ${response.status} ${response.statusText}`)
 
     const sales = await response.json()
 
     if (!sales || sales.length === 0) {
-      await supabase
-        .from('sync_state')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', 'wb_sales_sync')
-        
+      await supabase.from('sync_state').update({ updated_at: new Date().toISOString() }).eq('id', 'wb_sales_sync')
       return new Response(
-        JSON.stringify({ 
-          message: `Нет новых данных о продажах. Обогащено srid: ${enrichedCount}`, 
-          updatedCount: 0 
-        }),
+        JSON.stringify({ message: `Нет новых данных о продажах.`, updatedCount: 0 }),
         { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
       )
     }
 
+    // 3. ОПТИМИЗАЦИЯ: Получаем все srid из нашей базы в память
+    const { data: dbOrders } = await supabase
+      .from('orders')
+      .select('srid, wb_status')
+      .not('srid', 'is', null)
+
+    const dbOrdersMap = new Map()
+    if (dbOrders) {
+      for (const o of dbOrders) {
+        dbOrdersMap.set(o.srid, o.wb_status)
+      }
+    }
+
     let updatedCount = 0
     let latestChangeDate = syncState.last_change_date
+    const updatePromises = []
 
+    // 4. Перебираем продажи и готовим обновления
     for (const item of sales) {
       const srid = item.srid
       const isReturn = item.IsStorno === 1 || item.IsStorno === true
@@ -139,46 +85,38 @@ serve(async (req) => {
         latestChangeDate = item.lastChangeDate
       }
 
-      if (!srid) continue; // Теперь мы строго зависим от srid
+      // МГНОВЕННЫЙ ФИЛЬТР: Пропускаем чужие заказы, которых нет в нашей базе
+      if (!srid || !dbOrdersMap.has(srid)) continue; 
 
-      if (isReturn) {
-        const { data, error } = await supabase
-          .from('orders')
-          .update({ wb_status: 'returned', returned_at: date })
-          .eq('srid', srid) // ИЩЕМ СТРОГО ПО SRID!
-          .not('wb_status', 'eq', 'returned')
-          .select()
-          
-        if (!error && data && data.length > 0) {
-          updatedCount++
-        }
-      } else {
-        const { data, error } = await supabase
-          .from('orders')
-          .update({ wb_status: 'sold', sold_at: date })
-          .eq('srid', srid) // ИЩЕМ СТРОГО ПО SRID!
-          .not('wb_status', 'eq', 'sold')
-          .select()
-          
-        if (!error && data && data.length > 0) {
-          updatedCount++
-        }
+      const currentStatus = dbOrdersMap.get(srid)
+      const targetStatus = isReturn ? 'returned' : 'sold'
+
+      // Обновляем только если статус реально изменился
+      if (currentStatus !== targetStatus) {
+        updatePromises.push(
+          supabase.from('orders').update({ 
+            wb_status: targetStatus, 
+            [isReturn ? 'returned_at' : 'sold_at']: date 
+          }).eq('srid', srid)
+        )
+        dbOrdersMap.set(srid, targetStatus) // Защита от дублей
       }
     }
 
+    // 5. Выполняем обновления пачками по 10
+    for (let i = 0; i < updatePromises.length; i += 10) {
+      await Promise.all(updatePromises.slice(i, i + 10))
+      updatedCount += updatePromises.slice(i, i + 10).length
+    }
+
+    // 6. Обновляем дату последней синхронизации
     await supabase
       .from('sync_state')
-      .update({ 
-        last_change_date: latestChangeDate, 
-        updated_at: new Date().toISOString() 
-      })
+      .update({ last_change_date: latestChangeDate, updated_at: new Date().toISOString() })
       .eq('id', 'wb_sales_sync')
 
     return new Response(
-      JSON.stringify({ 
-        message: `Синхронизация завершена! Обогащено srid: ${enrichedCount}. Обновлено продаж: ${updatedCount}.`,
-        updatedCount 
-      }),
+      JSON.stringify({ message: `Синхронизация завершена! Обновлено продаж: ${updatedCount}.`, updatedCount }),
       { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )
 

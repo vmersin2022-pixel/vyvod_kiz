@@ -1,7 +1,105 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { format } from 'date-fns';
-import { CheckCircle2, XCircle, Copy, Download, AlertCircle, ClipboardList, RefreshCw } from 'lucide-react';
+import { CheckCircle2, XCircle, Copy, Download, AlertCircle, ClipboardList, RefreshCw, Database, PlayCircle, Loader2 } from 'lucide-react';
+
+// --- КОМПОНЕНТ МИГРАЦИИ ИСТОРИИ ---
+function HistoryMigration({ onComplete }: { onComplete: () => void }) {
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [isDone, setIsDone] = useState(false);
+  const [stats, setStats] = useState({ processed: 0, found: 0 });
+  const [cooldown, setCooldown] = useState(0);
+
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (cooldown > 0 && isMigrating) {
+      timer = setTimeout(() => setCooldown(c => c - 1), 1000);
+    } else if (cooldown === 0 && isMigrating && !isDone) {
+      fetchHistoryChunk();
+    }
+    return () => clearTimeout(timer);
+  }, [cooldown, isMigrating, isDone]);
+
+  const fetchHistoryChunk = async () => {
+    try {
+      const { data, error } = await supabase.functions.invoke('sync-history');
+      
+      if (error || data?.error) {
+         setCooldown(61); 
+         return;
+      }
+
+      if (data.done) {
+        setIsDone(true);
+        setIsMigrating(false);
+        onComplete();
+      } else {
+        setStats(prev => ({
+          processed: prev.processed + (data.processed || 0),
+          found: prev.found + (data.foundKiz || 0)
+        }));
+        setCooldown(61);
+      }
+    } catch (err) {
+      console.error("Ошибка миграции:", err);
+      setIsMigrating(false);
+    }
+  };
+
+  const handleStart = () => {
+    setIsMigrating(true);
+    setIsDone(false);
+    setStats({ processed: 0, found: 0 });
+    setCooldown(0);
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-xl border border-zinc-200 mb-6 shadow-sm">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h3 className="text-lg font-bold text-zinc-900 flex items-center gap-2">
+            <Database className="w-5 h-5 text-indigo-600" />
+            Глубокая миграция истории (за год)
+          </h3>
+          <p className="text-sm text-zinc-500 mt-1">
+            Автоматическая выгрузка старых КИЗов из отчетов реализации WB.
+          </p>
+        </div>
+
+        {!isMigrating && !isDone && (
+          <button
+            onClick={handleStart}
+            className="flex items-center justify-center gap-2 bg-indigo-600 text-white px-6 py-2.5 rounded-lg hover:bg-indigo-700 transition font-medium shadow-sm"
+          >
+            <PlayCircle className="w-5 h-5" />
+            Начать загрузку
+          </button>
+        )}
+
+        {isMigrating && (
+          <div className="flex items-center gap-4 bg-indigo-50 px-5 py-3 rounded-lg border border-indigo-100 min-w-[300px]">
+            <Loader2 className="w-6 h-6 text-indigo-600 animate-spin shrink-0" />
+            <div className="text-sm">
+              <div className="font-bold text-indigo-900">
+                {cooldown > 0 ? `Ожидание лимита WB: ${cooldown} сек...` : 'Скачивание пачки (до 100 000 строк)...'}
+              </div>
+              <div className="text-indigo-700 mt-0.5 font-medium">
+                Проверено: {stats.processed.toLocaleString()} | Найдено КИЗ: {stats.found.toLocaleString()}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isDone && (
+          <div className="flex items-center gap-2 text-emerald-700 bg-emerald-50 px-5 py-3 rounded-lg border border-emerald-200 font-medium">
+            <CheckCircle2 className="w-5 h-5" />
+            <span>Миграция успешно завершена! Найдено марок: {stats.found}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 type Task = {
   id: string;
@@ -183,6 +281,10 @@ export default function ChzTasks() {
       <div className="px-8 py-6 border-b border-zinc-200">
         <h1 className="text-2xl font-semibold text-zinc-900">Задачи Честного Знака</h1>
         <p className="text-zinc-500 mt-1">Оформление вывода из оборота и возвратов</p>
+      </div>
+
+      <div className="px-8 pt-6">
+        <HistoryMigration onComplete={fetchTasks} />
       </div>
 
       {/* Tabs & Actions */}
