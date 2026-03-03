@@ -56,31 +56,62 @@ serve(async (req) => {
     const tasksToInsert = []
     let nextRrdid = currentRrdid
 
+    // Счетчики для аналитики
+    let missingKizCount = 0
+    let wrongDocTypeCount = 0
+    let loggedMissingKiz = 0
+    let loggedWrongType = 0
+    let lastProcessedDate = ''
+
     for (const row of report) {
       nextRrdid = row.rrdid
+      lastProcessedDate = row.rr_dt || row.sale_dt || lastProcessedDate
       
-      if (row.kiz) {
-        if (row.doc_type_name === 'Продажа') {
-          tasksToInsert.push({
-            kiz: row.kiz,
-            task_type: 'OUT',
-            task_status: 'NEW',
-            srid: row.srid,
-            vendor_code: row.sa_name || '',
-            size: row.ts_name || ''
-          })
-        } else if (row.doc_type_name === 'Возврат') {
-          tasksToInsert.push({
-            kiz: row.kiz,
-            task_type: 'RETURN',
-            task_status: 'NEW',
-            srid: row.srid,
-            vendor_code: row.sa_name || '',
-            size: row.ts_name || ''
-          })
+      if (!row.kiz) {
+        missingKizCount++
+        // Логируем первые 2 строки без КИЗа для примера
+        if (loggedMissingKiz < 2) {
+          console.log('Пропущено (Нет КИЗ):', JSON.stringify({ doc_type: row.doc_type_name, date: row.rr_dt, srid: row.srid }))
+          loggedMissingKiz++
+        }
+        continue
+      }
+
+      if (row.doc_type_name === 'Продажа') {
+        tasksToInsert.push({
+          kiz: row.kiz,
+          task_type: 'OUT',
+          task_status: 'NEW',
+          srid: row.srid,
+          vendor_code: row.sa_name || '',
+          size: row.ts_name || ''
+        })
+      } else if (row.doc_type_name === 'Возврат') {
+        tasksToInsert.push({
+          kiz: row.kiz,
+          task_type: 'RETURN',
+          task_status: 'NEW',
+          srid: row.srid,
+          vendor_code: row.sa_name || '',
+          size: row.ts_name || ''
+        })
+      } else {
+        wrongDocTypeCount++
+        // Логируем первые 2 строки с КИЗом, но другим типом документа
+        if (loggedWrongType < 2) {
+          console.log('Пропущено (Другой тип документа):', row.doc_type_name, 'КИЗ:', row.kiz)
+          loggedWrongType++
         }
       }
     }
+
+    console.log(`--- Итоги пачки ---`)
+    console.log(`Всего строк: ${report.length}`)
+    console.log(`Без КИЗа: ${missingKizCount}`)
+    console.log(`С КИЗом, но не продажа/возврат: ${wrongDocTypeCount}`)
+    console.log(`Добавлено в базу: ${tasksToInsert.length}`)
+    console.log(`Последняя дата в пачке: ${lastProcessedDate}`)
+    console.log(`-------------------`)
 
     // 6. Массово сохраняем задачи в базу (с защитой от дублей по КИЗу)
     if (tasksToInsert.length > 0) {
