@@ -26,9 +26,9 @@ serve(async (req) => {
     const dateFrom = '2024-01-01' 
     const dateTo = new Date().toISOString().split('T')[0]
 
-    // 2. Делаем 1 запрос в WB (лимит 100 000 строк)
+    // 2. Делаем 1 запрос в WB (лимит 10 000 строк для экономии памяти)
     const response = await fetch(
-      `https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=100000&rrdid=${currentRrdid}`,
+      `https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=10000&rrdid=${currentRrdid}`,
       { headers: { 'Authorization': wbToken } }
     )
 
@@ -84,7 +84,11 @@ serve(async (req) => {
 
     // 6. Массово сохраняем задачи в базу (с защитой от дублей по КИЗу)
     if (tasksToInsert.length > 0) {
-      await supabase.from('chz_tasks').upsert(tasksToInsert, { onConflict: 'kiz', ignoreDuplicates: true })
+      // Разбиваем на пачки по 1000 штук, чтобы не перегрузить базу и память
+      for (let i = 0; i < tasksToInsert.length; i += 1000) {
+        const chunk = tasksToInsert.slice(i, i + 1000)
+        await supabase.from('chz_tasks').upsert(chunk, { onConflict: 'kiz', ignoreDuplicates: true })
+      }
     }
 
     // 7. Запоминаем новый rrdid для следующего выстрела
