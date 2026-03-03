@@ -44,10 +44,10 @@ serve(async (req) => {
       }
     }
 
-    // Для первого теста возьмем период в 1 месяц от startDateStr, чтобы не упереться в таймаут
+    // Для обхода лимита WB (10 запросов в 5 часов) берем период в 3 месяца!
     const dateFrom = new Date(startDateStr)
     const dateTo = new Date(dateFrom)
-    dateTo.setMonth(dateTo.getMonth() + 1) // +1 месяц
+    dateTo.setMonth(dateTo.getMonth() + 3) // +3 месяца
     
     // Если dateTo больше сегодня, ограничиваем сегодняшним днем
     const today = new Date()
@@ -80,7 +80,7 @@ serve(async (req) => {
     if (!response.ok) throw new Error(`WB API Error: ${response.status} ${response.statusText}`)
 
     const json = await response.json()
-    const reportData = json.data || [] // В документации обычно просто data
+    const reportData = json.response?.data || [] 
 
     if (!reportData || reportData.length === 0) {
       // Данных за этот месяц нет, двигаем ползунок дальше
@@ -120,7 +120,9 @@ serve(async (req) => {
         continue
       }
 
-      if (operation?.toLowerCase() === 'продажа' || operation?.toLowerCase() === 'sale') {
+      const opLower = operation?.toLowerCase() || ''
+
+      if (opLower === 'продажа' || opLower === 'sale' || opLower === 'вывод из оборота') {
         tasksToInsert.push({
           kiz: kiz,
           task_type: 'OUT',
@@ -129,7 +131,7 @@ serve(async (req) => {
           vendor_code: row.vendorCode || row.sa_name || '',
           size: row.size || row.ts_name || ''
         })
-      } else if (operation?.toLowerCase() === 'возврат' || operation?.toLowerCase() === 'return') {
+      } else if (opLower === 'возврат' || opLower === 'return') {
         tasksToInsert.push({
           kiz: kiz,
           task_type: 'RETURN',
