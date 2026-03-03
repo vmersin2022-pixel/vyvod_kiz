@@ -60,18 +60,10 @@ export default function ChzTasks() {
     setSyncing(true);
     
     try {
-      const wbToken = import.meta.env.VITE_WB_API_TOKEN;
-      
-      if (!wbToken) {
-        alert('Внимание: Токен WB API не настроен в переменных окружения (VITE_WB_API_TOKEN). Синхронизация невозможна.');
-        setSyncing(false);
-        return;
-      }
-
-      // 1. Check DB first to prevent spamming WB API if another user just synced
+      // 1. Check DB first to prevent spamming the Edge Function if another user just synced
       const { data: syncState, error: syncError } = await supabase
         .from('sync_state')
-        .select('last_change_date, updated_at')
+        .select('updated_at')
         .eq('id', 'wb_sales_sync')
         .single();
 
@@ -89,87 +81,34 @@ export default function ChzTasks() {
         setSyncing(false);
         return;
       }
-      
-      const dateFrom = new Date(syncState.last_change_date).toISOString().split('T')[0];
 
-      // 2. Fetch data from WB API
-      const response = await fetch(`https://statistics-api.wildberries.ru/api/v1/supplier/sales?dateFrom=${dateFrom}&flag=0`, {
-        headers: {
-          'Authorization': wbToken
+      // 2. Call the secure Supabase Edge Function
+      const { data, error } = await supabase.functions.invoke('sync-wb-sales');
+
+      // 3. Handle errors returned by the Edge Function
+      if (error) {
+        // Supabase functions.invoke wraps HTTP errors in a specific format
+        if (error.status === 429) {
+          // Try to parse the custom error message we sent from the Edge Function
+          let waitSeconds = 60;
+          try {
+            const errorData = JSON.parse(error.message);
+            if (errorData.retryAfter) waitSeconds = errorData.retryAfter;
+          } catch (e) {
+            // Fallback if parsing fails
+          }
+          setCooldown(waitSeconds);
+          throw new Error(`Слишком много запросов к WB. Попробуйте через ${waitSeconds} сек.`);
         }
-      });
-
-      // 3. Smart Error Handling for 429 Too Many Requests
-      if (response.status === 429) {
-        // WB API usually doesn't send Retry-After in standard format, but we check just in case
-        const retryAfter = response.headers.get('Retry-After');
-        const waitSeconds = retryAfter ? parseInt(retryAfter, 10) : 60; // Default to 60s if header is missing
-        
-        setCooldown(waitSeconds);
-        throw new Error(`Слишком много запросов к WB (Лимит 1 запрос в минуту). Попробуйте через ${waitSeconds} сек.`);
+        throw new Error(`Ошибка сервера: ${error.message}`);
       }
 
-      if (!response.ok) {
-        throw new Error(`Ошибка API WB: ${response.status} ${response.statusText}`);
+      // 4. Handle successful response
+      if (data && data.message) {
+        alert(data.message);
+      } else {
+        alert('Синхронизация завершена!');
       }
-
-      const sales = await response.json();
-
-      if (!sales || sales.length === 0) {
-        // Update the updated_at timestamp so the 60s cooldown applies even if no new data
-        await supabase
-          .from('sync_state')
-          .update({ updated_at: new Date().toISOString() })
-          .eq('id', 'wb_sales_sync');
-          
-        alert('Нет новых данных о продажах или возвратах от WB.');
-        setCooldown(60); // Start cooldown
-        setSyncing(false);
-        return;
-      }
-
-      let updatedCount = 0;
-      let latestChangeDate = syncState.last_change_date;
-
-      // 4. Process sales and update orders in Supabase
-      for (const item of sales) {
-        const srid = item.srid;
-        const isReturn = item.IsStorno === 1 || item.IsStorno === true;
-        const date = item.date;
-        
-        if (item.lastChangeDate && new Date(item.lastChangeDate) > new Date(latestChangeDate)) {
-          latestChangeDate = item.lastChangeDate;
-        }
-
-        if (isReturn) {
-          const { error } = await supabase
-            .from('orders')
-            .update({ wb_status: 'returned', returned_at: date })
-            .eq('srid', srid)
-            .not('wb_status', 'eq', 'returned');
-            
-          if (!error) updatedCount++;
-        } else {
-          const { error } = await supabase
-            .from('orders')
-            .update({ wb_status: 'sold', sold_at: date })
-            .eq('srid', srid)
-            .not('wb_status', 'eq', 'sold');
-            
-          if (!error) updatedCount++;
-        }
-      }
-
-      // 5. Update last sync date AND updated_at timestamp
-      await supabase
-        .from('sync_state')
-        .update({ 
-          last_change_date: latestChangeDate, 
-          updated_at: new Date().toISOString() 
-        })
-        .eq('id', 'wb_sales_sync');
-
-      alert(`Синхронизация завершена! Обновлено заказов: ${updatedCount}. Задачи ЧЗ созданы автоматически.`);
       
       setCooldown(60); // Start 60s cooldown after successful sync
       fetchTasks();
