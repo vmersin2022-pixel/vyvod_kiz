@@ -109,36 +109,35 @@ serve(async (req) => {
         loggedSample = true
       }
 
-      // В новом API поля могут называться markCode, operation, srid, fiscalDt
-      const kiz = row.markCode || row.kiz
-      const operation = row.operation || row.doc_type_name
+      // В новом API поля называются excise_short, operation_type_id, srid, fiscal_dt
+      const kiz = row.excise_short
+      const operationId = row.operation_type_id
       const srid = row.srid
-      const date = row.fiscalDt || row.date || dateFromStr
+      const date = row.fiscal_dt || dateFromStr
 
       if (!kiz) {
         missingKizCount++
         continue
       }
 
-      const opLower = operation?.toLowerCase() || ''
-
-      if (opLower === 'продажа' || opLower === 'sale' || opLower === 'вывод из оборота') {
+      // В API: 1 - Продажа, 2 - Возврат, 3 - Брак (или другие статусы)
+      if (operationId === 1) {
         tasksToInsert.push({
           kiz: kiz,
           task_type: 'OUT',
           task_status: 'NEW',
           srid: srid || `sync-${kiz}`, // fallback если srid нет
-          vendor_code: row.vendorCode || row.sa_name || '',
-          size: row.size || row.ts_name || ''
+          vendor_code: row.nm_id ? row.nm_id.toString() : '',
+          size: ''
         })
-      } else if (opLower === 'возврат' || opLower === 'return') {
+      } else if (operationId === 2) {
         tasksToInsert.push({
           kiz: kiz,
           task_type: 'RETURN',
           task_status: 'NEW',
           srid: srid || `sync-${kiz}`,
-          vendor_code: row.vendorCode || row.sa_name || '',
-          size: row.size || row.ts_name || ''
+          vendor_code: row.nm_id ? row.nm_id.toString() : '',
+          size: ''
         })
       } else {
         wrongDocTypeCount++
