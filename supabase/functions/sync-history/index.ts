@@ -128,7 +128,8 @@ serve(async (req) => {
           task_status: 'NEW',
           srid: srid || `sync-${kiz}`, // fallback если srid нет
           vendor_code: row.nm_id ? row.nm_id.toString() : '',
-          size: ''
+          size: '',
+          sale_date: date
         })
       } else if (operationId === 2) {
         tasksToInsert.push({
@@ -137,7 +138,8 @@ serve(async (req) => {
           task_status: 'NEW',
           srid: srid || `sync-${kiz}`,
           vendor_code: row.nm_id ? row.nm_id.toString() : '',
-          size: ''
+          size: '',
+          sale_date: date
         })
       } else {
         wrongDocTypeCount++
@@ -155,7 +157,10 @@ serve(async (req) => {
     if (tasksToInsert.length > 0) {
       for (let i = 0; i < tasksToInsert.length; i += 1000) {
         const chunk = tasksToInsert.slice(i, i + 1000)
-        await supabase.from('chz_tasks').upsert(chunk, { onConflict: 'kiz', ignoreDuplicates: true })
+        const { error } = await supabase.from('chz_tasks').upsert(chunk, { onConflict: 'kiz', ignoreDuplicates: true })
+        if (error) {
+          console.error('Ошибка вставки в БД:', error)
+        }
       }
     }
 
@@ -164,7 +169,12 @@ serve(async (req) => {
     
     if (dateToStr === today.toISOString().split('T')[0]) {
       await supabase.from('sync_state').update({ rrdid: 0 }).eq('id', 'history_sync')
-      return new Response(JSON.stringify({ done: true, message: 'Миграция полностью завершена!' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ 
+        done: true, 
+        message: 'Миграция полностью завершена!',
+        processed: reportData.length,
+        foundKiz: tasksToInsert.length
+      }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
     await supabase.from('sync_state').update({ rrdid: nextDateNum }).eq('id', 'history_sync')

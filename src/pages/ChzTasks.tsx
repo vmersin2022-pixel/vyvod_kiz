@@ -30,6 +30,10 @@ function HistoryMigration({ onComplete }: { onComplete: () => void }) {
       }
 
       if (data.done) {
+        setStats(prev => ({
+          processed: prev.processed + (data.processed || 0),
+          found: prev.found + (data.foundKiz || 0)
+        }));
         setIsDone(true);
         setIsMigrating(false);
         onComplete();
