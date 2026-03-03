@@ -15,124 +15,168 @@ serve(async (req) => {
 
     if (!wbToken) throw new Error('WB_API_TOKEN is missing')
 
-    // 1. Читаем текущий прогресс из базы
+    // 1. Читаем текущий прогресс из базы (теперь rrdid будет хранить дату, с которой начать)
+    // Формат: YYYY-MM-DD. Если 0 или пусто - начинаем год назад.
     const { data: syncState } = await supabase
       .from('sync_state')
       .select('rrdid')
       .eq('id', 'history_sync')
       .single()
 
-    const currentRrdid = syncState?.rrdid || 0
-    const dateFrom = '2024-01-01' 
-    const dateTo = new Date().toISOString().split('T')[0]
+    let startDateStr = ''
+    if (!syncState?.rrdid || syncState.rrdid === 0) {
+      // Начинаем ровно год назад от сегодня
+      const oneYearAgo = new Date()
+      oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
+      startDateStr = oneYearAgo.toISOString().split('T')[0]
+    } else {
+      // Иначе берем сохраненную дату (мы будем сохранять ее как число YYYYMMDD для совместимости с rrdid, 
+      // но лучше пока просто брать 1 день для теста, если там мусор от старой логики)
+      // Для надежности, если там старый rrdid (миллионы), сбросим на год назад
+      if (syncState.rrdid > 20300000) {
+        const oneYearAgo = new Date()
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
+        startDateStr = oneYearAgo.toISOString().split('T')[0]
+      } else {
+        // Конвертируем YYYYMMDD обратно в YYYY-MM-DD
+        const str = syncState.rrdid.toString()
+        startDateStr = `${str.substring(0,4)}-${str.substring(4,6)}-${str.substring(6,8)}`
+      }
+    }
 
-    // 2. Делаем 1 запрос в WB (лимит 10 000 строк для экономии памяти)
+    // Для первого теста возьмем период в 1 месяц от startDateStr, чтобы не упереться в таймаут
+    const dateFrom = new Date(startDateStr)
+    const dateTo = new Date(dateFrom)
+    dateTo.setMonth(dateTo.getMonth() + 1) // +1 месяц
+    
+    // Если dateTo больше сегодня, ограничиваем сегодняшним днем
+    const today = new Date()
+    if (dateTo > today) {
+      dateTo.setTime(today.getTime())
+    }
+
+    const dateFromStr = dateFrom.toISOString().split('T')[0]
+    const dateToStr = dateTo.toISOString().split('T')[0]
+
+    console.log(`Запрашиваем период: ${dateFromStr} - ${dateToStr}`)
+
+    // 2. Делаем POST запрос к API Аналитики (Отчет по КИЗам)
     const response = await fetch(
-      `https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=10000&rrdid=${currentRrdid}`,
-      { headers: { 'Authorization': wbToken } }
+      `https://seller-analytics-api.wildberries.ru/api/v1/analytics/excise-report?dateFrom=${dateFromStr}&dateTo=${dateToStr}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': wbToken,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({}) // пустой объект, чтобы получить все страны
+      }
     )
 
-    // 3. Обработка лимитов (429)
     if (response.status === 429) {
-      return new Response(JSON.stringify({ error: 'Rate limit', wait: 60 }), { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ error: 'Rate limit (10 запросов в 5 часов)', wait: 300 }), { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
-    // 4. Код 204 означает, что данных больше нет
-    if (response.status === 204) {
-      await supabase.from('sync_state').update({ rrdid: 0 }).eq('id', 'history_sync')
-      return new Response(JSON.stringify({ done: true, message: 'Миграция полностью завершена!' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    if (!response.ok) throw new Error(`WB API Error: ${response.status} ${response.statusText}`)
+
+    const json = await response.json()
+    const reportData = json.data || [] // В документации обычно просто data
+
+    if (!reportData || reportData.length === 0) {
+      // Данных за этот месяц нет, двигаем ползунок дальше
+      const nextDateNum = parseInt(dateToStr.replace(/-/g, ''))
+      
+      if (dateToStr === today.toISOString().split('T')[0]) {
+        // Дошли до сегодня
+        await supabase.from('sync_state').update({ rrdid: 0 }).eq('id', 'history_sync')
+        return new Response(JSON.stringify({ done: true, message: 'Миграция полностью завершена!' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+      }
+
+      await supabase.from('sync_state').update({ rrdid: nextDateNum }).eq('id', 'history_sync')
+      return new Response(JSON.stringify({ done: false, message: `Нет данных за ${dateFromStr}-${dateToStr}, идем дальше` }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
-    if (!response.ok) throw new Error(`WB API Error: ${response.status}`)
-
-    const report = await response.json()
-    
-    if (!report || report.length === 0) {
-      await supabase.from('sync_state').update({ rrdid: 0 }).eq('id', 'history_sync')
-      return new Response(JSON.stringify({ done: true }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
-    }
-
-    // 5. Фильтруем продажи и возвраты, вытаскиваем КИЗы
+    // 3. Фильтруем продажи и возвраты, вытаскиваем КИЗы
     const tasksToInsert = []
-    let nextRrdid = currentRrdid
-
-    // Счетчики для аналитики
     let missingKizCount = 0
     let wrongDocTypeCount = 0
-    let loggedMissingKiz = 0
-    let loggedWrongType = 0
-    let lastProcessedDate = ''
+    let loggedSample = false
 
-    for (const row of report) {
-      nextRrdid = row.rrdid
-      lastProcessedDate = row.rr_dt || row.sale_dt || lastProcessedDate
-      
-      if (!row.kiz) {
+    for (const row of reportData) {
+      // Логируем первую строку, чтобы увидеть реальные названия полей
+      if (!loggedSample) {
+        console.log('Пример строки из нового API:', JSON.stringify(row))
+        loggedSample = true
+      }
+
+      // В новом API поля могут называться markCode, operation, srid, fiscalDt
+      const kiz = row.markCode || row.kiz
+      const operation = row.operation || row.doc_type_name
+      const srid = row.srid
+      const date = row.fiscalDt || row.date || dateFromStr
+
+      if (!kiz) {
         missingKizCount++
-        // Логируем первые 2 строки без КИЗа для примера
-        if (loggedMissingKiz < 2) {
-          console.log('Пропущено (Нет КИЗ):', JSON.stringify({ doc_type: row.doc_type_name, date: row.rr_dt, srid: row.srid }))
-          loggedMissingKiz++
-        }
         continue
       }
 
-      if (row.doc_type_name === 'Продажа') {
+      if (operation?.toLowerCase() === 'продажа' || operation?.toLowerCase() === 'sale') {
         tasksToInsert.push({
-          kiz: row.kiz,
+          kiz: kiz,
           task_type: 'OUT',
           task_status: 'NEW',
-          srid: row.srid,
-          vendor_code: row.sa_name || '',
-          size: row.ts_name || ''
+          srid: srid || `sync-${kiz}`, // fallback если srid нет
+          vendor_code: row.vendorCode || row.sa_name || '',
+          size: row.size || row.ts_name || ''
         })
-      } else if (row.doc_type_name === 'Возврат') {
+      } else if (operation?.toLowerCase() === 'возврат' || operation?.toLowerCase() === 'return') {
         tasksToInsert.push({
-          kiz: row.kiz,
+          kiz: kiz,
           task_type: 'RETURN',
           task_status: 'NEW',
-          srid: row.srid,
-          vendor_code: row.sa_name || '',
-          size: row.ts_name || ''
+          srid: srid || `sync-${kiz}`,
+          vendor_code: row.vendorCode || row.sa_name || '',
+          size: row.size || row.ts_name || ''
         })
       } else {
         wrongDocTypeCount++
-        // Логируем первые 2 строки с КИЗом, но другим типом документа
-        if (loggedWrongType < 2) {
-          console.log('Пропущено (Другой тип документа):', row.doc_type_name, 'КИЗ:', row.kiz)
-          loggedWrongType++
-        }
       }
     }
 
-    console.log(`--- Итоги пачки ---`)
-    console.log(`Всего строк: ${report.length}`)
+    console.log(`--- Итоги периода ${dateFromStr} - ${dateToStr} ---`)
+    console.log(`Всего строк: ${reportData.length}`)
     console.log(`Без КИЗа: ${missingKizCount}`)
     console.log(`С КИЗом, но не продажа/возврат: ${wrongDocTypeCount}`)
     console.log(`Добавлено в базу: ${tasksToInsert.length}`)
-    console.log(`Последняя дата в пачке: ${lastProcessedDate}`)
     console.log(`-------------------`)
 
-    // 6. Массово сохраняем задачи в базу (с защитой от дублей по КИЗу)
+    // 4. Массово сохраняем задачи в базу
     if (tasksToInsert.length > 0) {
-      // Разбиваем на пачки по 1000 штук, чтобы не перегрузить базу и память
       for (let i = 0; i < tasksToInsert.length; i += 1000) {
         const chunk = tasksToInsert.slice(i, i + 1000)
         await supabase.from('chz_tasks').upsert(chunk, { onConflict: 'kiz', ignoreDuplicates: true })
       }
     }
 
-    // 7. Запоминаем новый rrdid для следующего выстрела
-    await supabase.from('sync_state').update({ rrdid: nextRrdid }).eq('id', 'history_sync')
+    // 5. Запоминаем новую дату для следующего выстрела
+    const nextDateNum = parseInt(dateToStr.replace(/-/g, ''))
+    
+    if (dateToStr === today.toISOString().split('T')[0]) {
+      await supabase.from('sync_state').update({ rrdid: 0 }).eq('id', 'history_sync')
+      return new Response(JSON.stringify({ done: true, message: 'Миграция полностью завершена!' }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
+    }
+
+    await supabase.from('sync_state').update({ rrdid: nextDateNum }).eq('id', 'history_sync')
 
     return new Response(JSON.stringify({ 
       done: false, 
-      processed: report.length, 
+      processed: reportData.length, 
       foundKiz: tasksToInsert.length,
-      nextRrdid: nextRrdid
+      period: `${dateFromStr} - ${dateToStr}`
     }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
 
   } catch (error: any) {
+    console.error('Ошибка:', error.message)
     return new Response(JSON.stringify({ error: error.message }), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
   }
 })
